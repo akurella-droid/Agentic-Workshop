@@ -2,6 +2,7 @@
 
 Uses LangChain's create_agent to build an agent that calls get_ticket, then
 get_customer_history, applies TRIAGE_POLICY.md rules, and returns a TriageDecision.
+Integrates human-in-the-loop middleware for escalation approval.
 """
 
 import json
@@ -9,9 +10,14 @@ import os
 from pathlib import Path
 
 from langchain.agents import create_agent
+from langchain.agents.middleware.human_in_the_loop import HumanInTheLoopMiddleware
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_groq import ChatGroq
 from langchain_mcp_adapters.client import MultiServerMCPClient
+from langchain_core.tools import tool
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.types import Command
+from langgraph.errors import GraphInterrupt
 
 from triage_schema import TriageDecision, validate_decision
 
@@ -54,7 +60,11 @@ IMPORTANT: You MUST follow this process:
 1. First, call get_ticket(ticket_id) to retrieve the ticket details
 2. Then, call get_customer_history(customer_id) using the customer_id from the ticket
 3. Apply the triage policy rules to determine: category, priority, and route
-4. Return a JSON decision with exactly these fields: category, priority, route, rationale
+4. If the final priority is P1 AND the customer is on the Enterprise plan:
+   a. Call escalate_to_human to request approval from a human
+   b. Check the result: if it says "approved", set escalated to true; otherwise set it to false
+5. For all other cases, set escalated to false
+6. Return a JSON decision with exactly these fields: category, priority, route, rationale, escalated
 
 {TRIAGE_POLICY_RULES}
 
@@ -64,11 +74,32 @@ CRITICAL: Your response must end with a valid JSON block in this exact format:
   "category": "<one of: billing, bug, access, performance, how-to>",
   "priority": "<one of: P1, P2, P3, P4>",
   "route": "<one of: billing-team, bug-team, access-team, performance-team, how-to-team>",
-  "rationale": "<one sentence explaining which rule you applied>"
+  "rationale": "<one sentence explaining which rule you applied>",
+  "escalated": <true if P1 + Enterprise and human approved, false otherwise>
 }}
 ```
 
 Do not include any text after the closing }}. Only the JSON block."""
+
+
+@tool
+def escalate_to_human(reason: str) -> str:
+    """Escalate the triage decision to a human for approval.
+
+    This tool is gated by human-in-the-loop middleware. When called, it pauses
+    the agent and waits for human approval. The human's decision (approve/reject)
+    is returned to continue the agent.
+
+    Args:
+        reason: The reason for escalation (e.g., "P1 priority + Enterprise customer")
+
+    Returns:
+        A string indicating the human's decision: "approved" or "rejected"
+    """
+    # This is a stub. The middleware gates this call and the actual
+    # approval/rejection logic is handled in run_agent.py when resuming.
+    # This tool's presence triggers the middleware interrupt.
+    return "pending_human_decision"
 
 
 def extract_response_text(agent_result) -> str:
@@ -140,12 +171,11 @@ async def triage(ticket_id: str) -> dict:
         ticket_id: The ID of the ticket to triage (e.g., "T-1042")
 
     Returns:
-        A dict with keys: category, priority, route, rationale
+        A dict with keys: category, priority, route, rationale, escalated
 
     Raises:
         ValueError: If ticket not found, validation fails twice, or agent fails
     """
-
     # Validate provider and API key
     provider = os.getenv("PROVIDER", "gemini").lower()
 
@@ -187,17 +217,38 @@ async def triage(ticket_id: str) -> dict:
     if missing_tools:
         raise ValueError(f"Required MCP tools not available: {', '.join(missing_tools)}") from None
 
-    # Create agent with system prompt
+    # Add local escalate_to_human tool
+    tools = list(tools) + [escalate_to_human]
+
+    # Create checkpointer for human-in-the-loop middleware
+    checkpointer = MemorySaver()
+
+    # Create human-in-the-loop middleware
+    # Interrupt on escalate_to_human with respond decision allowed
+    # (respond is used to return a custom message as the tool result)
+    middleware = HumanInTheLoopMiddleware(
+        interrupt_on={
+            "escalate_to_human": {
+                "allowed_decisions": ["respond"]
+            }
+        }
+    )
+
+    # Create agent with system prompt, middleware and checkpointer
+    # Use a fixed thread_id for this single-ticket run
     agent = create_agent(
         model=model,
         tools=tools,
-        system_prompt=SYSTEM_PROMPT
+        system_prompt=SYSTEM_PROMPT,
+        middleware=[middleware],
+        checkpointer=checkpointer
     )
 
-    # Run agent to triage the ticket
+    # Run agent to triage the ticket, handling interrupts
     max_retries = 1
     last_error = None
     user_message = f"Triage support ticket: {ticket_id}"
+    config = {"configurable": {"thread_id": ticket_id}}
 
     try:
         for attempt in range(max_retries + 1):
@@ -212,27 +263,64 @@ async def triage(ticket_id: str) -> dict:
                     ]
                 }
 
-                # Run the agent
-                agent_result = await agent.ainvoke(input_data)
+                # Run the agent loop, handling interrupts
+                while True:
+                    try:
+                        # Run the agent
+                        agent_result = await agent.ainvoke(input_data, config=config)
 
-                # Extract the agent's response text
-                response_text = extract_response_text(agent_result)
+                        # If we get here, no interrupt occurred
+                        # Extract the agent's response text
+                        response_text = extract_response_text(agent_result)
 
-                # Extract JSON from the response
-                decision_dict = extract_json_from_response(response_text)
+                        # Extract JSON from the response
+                        decision_dict = extract_json_from_response(response_text)
 
-                # Validate the decision against the schema
-                decision = validate_decision(decision_dict)
+                        # Extract and preserve the escalated field
+                        # (the schema doesn't include this field, so we handle it separately)
+                        escalated = decision_dict.pop("escalated", False)
 
-                # Return the validated decision as a dict
-                return decision.model_dump()
+                        # Validate the decision against the schema
+                        decision = validate_decision(decision_dict)
+
+                        # Return the validated decision as a dict, with escalated field added
+                        result = decision.model_dump()
+                        result["escalated"] = escalated
+                        return result
+
+                    except GraphInterrupt as e:
+                        # Human-in-the-loop interrupt for escalation approval
+                        # Prompt the user
+                        print("Escalate? (yes/no): ", end="", flush=True)
+                        user_input = input().strip().lower()
+
+                        # Only "yes" or "y" is approval; anything else is rejection
+                        approved = user_input in ("yes", "y")
+
+                        # Resume the agent with the user's decision
+                        # Use RespondDecision type to return a custom message as the tool result
+                        # This avoids actually executing the escalate_to_human tool function
+                        if approved:
+                            message = "approved"
+                        else:
+                            message = "rejected"
+                        resume_value = {"type": "respond", "message": message}
+                        input_data = Command(resume=resume_value)
 
             except (ValueError, json.JSONDecodeError) as e:
                 last_error = str(e)
                 if attempt < max_retries:
                     # Retry with error feedback to the agent
-                    error_feedback = f"The previous response was invalid. Error: {last_error}. Please return a valid JSON decision block with all required fields: category, priority, route, and rationale."
+                    error_feedback = f"The previous response was invalid. Error: {last_error}. Please return a valid JSON decision block with all required fields: category, priority, route, rationale, and escalated."
                     user_message = f"Triage support ticket: {ticket_id}\n\n{error_feedback}"
+                    input_data = {
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": user_message
+                            }
+                        ]
+                    }
                     continue
                 else:
                     # Second attempt failed, raise error without traceback
@@ -245,6 +333,14 @@ async def triage(ticket_id: str) -> dict:
                     # Retry with error feedback
                     error_feedback = f"The agent encountered an error: {last_error}. Please retry triaging this ticket."
                     user_message = f"Triage support ticket: {ticket_id}\n\n{error_feedback}"
+                    input_data = {
+                        "messages": [
+                            {
+                                "role": "user",
+                                "content": user_message
+                            }
+                        ]
+                    }
                     continue
                 else:
                     # Second attempt failed
