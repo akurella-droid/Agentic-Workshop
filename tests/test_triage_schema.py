@@ -27,14 +27,20 @@ def test_valid_json_string_returns_triage_decision():
 
 def test_missing_field_names_it():
     data = {k: v for k, v in VALID.items() if k != "route"}
-    with pytest.raises(ValueError, match="route"):
+    with pytest.raises(ValueError) as exc_info:
         validate_decision(data)
+    message = str(exc_info.value)
+    assert "route" in message
+    assert "Traceback" not in message
 
 
 def test_extra_field_names_it():
     data = dict(VALID, confidence=0.9)
-    with pytest.raises(ValueError, match="confidence"):
+    with pytest.raises(ValueError) as exc_info:
         validate_decision(data)
+    message = str(exc_info.value)
+    assert "confidence" in message
+    assert "Traceback" not in message
 
 
 def test_bad_priority_enum_names_field_and_allowed_values():
@@ -45,6 +51,7 @@ def test_bad_priority_enum_names_field_and_allowed_values():
     assert "priority" in message
     for priority in PRIORITIES:
         assert priority in message
+    assert "Traceback" not in message
 
 
 def test_bad_category_enum_names_field_and_allowed_values():
@@ -55,6 +62,7 @@ def test_bad_category_enum_names_field_and_allowed_values():
     assert "category" in message
     for category in CATEGORIES:
         assert category in message
+    assert "Traceback" not in message
 
 
 def test_bad_route_enum_names_field_and_allowed_values():
@@ -65,6 +73,7 @@ def test_bad_route_enum_names_field_and_allowed_values():
     assert "route" in message
     for route in ROUTES:
         assert route in message
+    assert "Traceback" not in message
 
 
 def test_category_route_mismatch_names_route_and_expected_route():
@@ -74,12 +83,34 @@ def test_category_route_mismatch_names_route_and_expected_route():
     message = str(exc_info.value)
     assert "route" in message
     assert "billing-team" in message
+    assert "Traceback" not in message
 
 
 def test_empty_rationale_names_field():
     data = dict(VALID, rationale="   ")
-    with pytest.raises(ValueError, match="rationale"):
+    with pytest.raises(ValueError) as exc_info:
         validate_decision(data)
+    message = str(exc_info.value)
+    assert "rationale" in message
+    assert "Traceback" not in message
+
+
+def test_non_string_rationale_none_names_field():
+    data = dict(VALID, rationale=None)
+    with pytest.raises(ValueError) as exc_info:
+        validate_decision(data)
+    message = str(exc_info.value)
+    assert "rationale" in message
+    assert "Traceback" not in message
+
+
+def test_non_string_rationale_int_names_field():
+    data = dict(VALID, rationale=42)
+    with pytest.raises(ValueError) as exc_info:
+        validate_decision(data)
+    message = str(exc_info.value)
+    assert "rationale" in message
+    assert "Traceback" not in message
 
 
 def test_multi_sentence_rationale_is_accepted():
@@ -94,13 +125,19 @@ def test_malformed_json_reports_not_valid_json():
 
 
 def test_non_object_list_reports_json_object_expected():
-    with pytest.raises(ValueError, match="JSON object"):
+    with pytest.raises(ValueError) as exc_info:
         validate_decision(json.dumps([]))
+    message = str(exc_info.value)
+    assert "JSON object" in message
+    assert "Traceback" not in message
 
 
 def test_non_object_string_reports_json_object_expected():
-    with pytest.raises(ValueError, match="JSON object"):
+    with pytest.raises(ValueError) as exc_info:
         validate_decision(json.dumps("billing"))
+    message = str(exc_info.value)
+    assert "JSON object" in message
+    assert "Traceback" not in message
 
 
 def test_error_never_contains_raw_traceback():

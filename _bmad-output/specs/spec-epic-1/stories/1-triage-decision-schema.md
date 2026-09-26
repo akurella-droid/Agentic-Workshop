@@ -60,6 +60,22 @@ context: ['{project-root}/_bmad-output/specs/spec-epic-1/SPEC.md', '{project-roo
 - Given `TriageDecision.model_json_schema()`, when inspected, then category, priority and route appear as `enum`s with exactly the allowed values, and `additionalProperties` is false. That is what makes it usable as LangChain structured output.
 - Given any rejected input, when `validate_decision` raises, then the message contains the offending field name(s) and never a raw Python traceback string.
 
+### Review Findings
+
+Independent re-review of `main...HEAD` (branch `story/Aswin-1.1`) against this story, run after the story was already merged and marked `done`. Four layers ran: blind-hunter, edge-case-hunter, verification-gap, acceptance-auditor. All four completed (no `failed_layers`).
+
+- [x] [Review][Patch] Assert "no raw traceback" and correct field-naming across every rejection path, including a non-string `rationale` (e.g. `None`, `42`) — currently only `test_error_never_contains_raw_traceback` (the malformed-JSON path) checks the no-traceback guarantee, and no test passes a non-string `rationale` at all [tests/test_triage_schema.py:40-103]
+
+**Rejected:**
+
+- `false` — Several "manually verified, no permanent test" items from this story's own Review Triage Log (multi-field formatting, non-str/non-dict top-level input, rationale required-ness in schema) were re-flagged by blind-hunter as needing permanent tests. Re-verified by hand: `validate_decision(None)`, `validate_decision(42)`, and a combined `priority="P9"` + mismatched category/route all still produce correctly-named, traceback-free errors. No new evidence of failure since the prior triage round — a documented process trade-off, not a re-openable defect.
+- `low`, rejected — `CATEGORY_TO_ROUTE` hand-duplicates `CATEGORIES`/`ROUTES` with no fallback. Duplicate of an already-rejected entry in this same Review Triage Log below; unreachable today since `Literal` field validation runs before the mismatch check, and a fix would add a guard for a state the program cannot currently reach.
+- `low`, rejected — `Literal[CATEGORIES]` subscripts `Literal` with a runtime tuple, which a static type checker (mypy/pyright) would reject. No type checker is configured or run anywhere in this repo, so it is not reachable today.
+- `low`, rejected — The category/route-mismatch error is raised in a `mode="after"` model validator with an empty pydantic `loc`, so `_format_validation_error` labels it `"decision: ..."` rather than `"route: ..."`; the existing test only passes because the free-text message happens to contain the word "route". Verified true structurally, but `test_category_route_mismatch_names_route_and_expected_route` already asserts `"route" in message`, so rewording the message to drop that word would fail that test today — the claimed fragility is already guarded.
+- `false` — A category/route mismatch combined with another field-level error (e.g. bad `priority`) skips `route_matches_category` entirely, since pydantic only runs `mode="after"` validators once all field validators pass, so the mismatch is silently omitted from the message. Confirmed via `priority="P9"` + mismatched category/route → message only names `priority`. This is the same claim already raised and dismissed as `false` in this story's own Review Triage Log below, for the same reason (standard pydantic v2 ordering, not a defect); no new evidence this round.
+- already deferred, not re-added — `SPEC.md`'s Open Questions (route/category pairing, rationale strictness) are resolved by this story but SPEC.md was never updated, since AGENTS.md restricts SPEC.md edits to `/bmad-spec`. Already tracked verbatim in `_bmad-output/implementation-artifacts/deferred-work.md` and in this story's own Review Triage Log below — not duplicated here.
+- rejected — `.memlog.md` committed under `_bmad-output/specs/spec-epic-1/`. Verified this is a pre-existing, consistent convention: `spec-epic-2/.memlog.md` and `spec-epic-3/.memlog.md` were already committed the same way before this diff, so this is not introduced by or unique to this change.
+
 ## Implementation Notes
 
 ## Spec Change Log
